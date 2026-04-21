@@ -1,99 +1,233 @@
 {
-  lib,
+  agplLicensed ? true,
+  buildGoModule,
   channel ? "stable",
-  fetchurl,
+  fetchFromGitHub,
+  fetchPnpmDeps,
   installShellFiles,
+  lib,
   makeBinaryWrapper,
-  terraform,
+  nodejs_20,
+  pnpmConfigHook,
+  pnpm,
   stdenvNoCC,
-  unzip,
-  nixosTests,
+  terraform,
+  zstd,
 }:
 
 let
-  inherit (stdenvNoCC.hostPlatform) system;
-
+  pnpm_nodejs_20 = pnpm.override {
+    nodejs = nodejs_20;
+  };
   channels = {
-    stable = {
-      version = "2.28.6";
-      hash = {
-        x86_64-linux = "sha256-OBnEOR6uNCzfsnWIQupSN9JMykNbrojrkb5lcPXL1W8=";
-        x86_64-darwin = "sha256-ixI5BPxq7spPk1Un6eYVke+IkhqoIxTqDTXo5FehaEk=";
-        aarch64-linux = "sha256-w+5PMff13nUp7jAYGSQlozShWqjsF+NLKQiquxD07wc=";
-        aarch64-darwin = "sha256-nrx0Z1NdzkeQbeWzwOhpATIYnCCucG5lKRoUaRVjiQE=";
+    stable = rec {
+      version = "2.31.9";
+      src = fetchFromGitHub {
+        owner = "coder";
+        repo = "coder";
+        rev = "v${version}";
+        hash = "sha256-8qZQ9lPPYYGoFOdo04aooekrwhZT9ND8YWlBdpUQesw=";
       };
+      vendorHash = "sha256-CqkC1W+0ymTxKCDp1j8k0/f31/VSuD4BmCs1YWjyaaU=";
+      pnpmDepsHash = "sha256-JlbjDBeBtz7vA9Ol+NmUdNYROzop9C6vnoDEsJTp0W8=";
     };
-    mainline = {
-      version = "2.29.1";
-      hash = {
-        x86_64-linux = "sha256-LxYADRdkiIsvHBaMy+MtJuUo8p5MLDKDL6pMtHaqokw=";
-        x86_64-darwin = "sha256-OwZpCTjEVzTu4M9jf0vOuTuiyn66qRc/pEO/DLD8pvg=";
-        aarch64-linux = "sha256-hNPimwzopC2Hj8i0I6KJAtvKXANACpmcN+onGvAaMvc=";
-        aarch64-darwin = "sha256-AuNFtvnG40Toll/hmEXeGuV6ZcxfuVuUTFqdtTLXRn8=";
+  };
+  subPackage = (if agplLicensed then "cmd/coder" else "enterprise/cmd/coder");
+  omitTags = [
+    "ts_omit_aws"
+    "ts_omit_bird"
+    "ts_omit_tap"
+    "ts_omit_kube"
+  ];
+  mkSlimBinary =
+    {
+      goos,
+      goarch,
+      goarm,
+      ...
+    }:
+    (buildGoModule rec {
+      pname = "coder-slim-${goos}-${goarch}";
+      version = channels.${channel}.version;
+      src = channels.${channel}.src;
+      vendorHash = channels.${channel}.vendorHash;
+      subPackages = [ subPackage ];
+      ldflags = [
+        "-s"
+        "-w"
+        "-X=github.com/coder/coder/v2/buildinfo.tag=${version}-slim-nixpkgs"
+      ]
+      ++ lib.optional agplLicensed "-X=github.com/coder/coder/v2/buildinfo.agpl=true";
+      tags = [ "slim" ] ++ omitTags;
+      env = {
+        GOOS = goos;
+        GOARCH = goarch;
+        GOARM = goarm;
+        CGO_ENABLED = "0";
       };
-    };
+      postBuild =
+        lib.optionalString
+          (
+            goos != stdenvNoCC.hostPlatform.go.GOOS
+            || goarch != stdenvNoCC.hostPlatform.go.GOARCH
+            || goarm != stdenvNoCC.hostPlatform.go.GOARM
+          )
+          ''
+            dir=$GOPATH/bin/''${GOOS}_''${GOARCH}
+            if [[ -n "$(shopt -s nullglob; echo $dir/*)" ]]; then
+              mv $dir/* $dir/..
+            fi
+            if [[ -d $dir ]]; then
+              rmdir $dir
+            fi
+          '';
+      doCheck = false;
+    }).overrideAttrs
+      (
+        finalAttrs: previousAttrs: {
+          env = previousAttrs.env // {
+            GOOS = goos;
+            GOARCH = goarch;
+            GOARM = goarm;
+          };
+        }
+      );
+  slimTargets = [
+    "windows_amd64"
+    "windows_arm64"
+    "linux_amd64"
+    "linux_arm64"
+    "linux_arm_7"
+    "darwin_amd64"
+    "darwin_arm64"
+  ];
+  slimBinaries = builtins.listToAttrs (
+    map (
+      target:
+      let
+        parts = lib.splitString "_" target;
+        goos = (builtins.elemAt parts 0);
+        goarch = (builtins.elemAt parts 1);
+        goarm = lib.optionalString (builtins.length parts > 2) (builtins.elemAt parts 2);
+      in
+      {
+        name = target;
+        value = mkSlimBinary {
+          inherit goos goarch goarm;
+        };
+      }
+    ) slimTargets
+  );
+  bundle = stdenvNoCC.mkDerivation {
+    pname = "coder-slim-bundle";
+    version = channels.${channel}.version;
+
+    nativeBuildInputs = [ zstd ];
+
+    unpackPhase = ''
+      runHook preUnpack
+
+      cp ${slimBinaries.linux_amd64}/bin/coder coder-linux-amd64
+      cp ${slimBinaries.linux_arm64}/bin/coder coder-linux-arm64
+      cp ${slimBinaries.linux_arm_7}/bin/coder coder-linux-armv7
+      cp ${slimBinaries.windows_amd64}/bin/coder.exe coder-windows-amd64.exe
+      cp ${slimBinaries.windows_arm64}/bin/coder.exe coder-windows-arm64.exe
+      cp ${slimBinaries.darwin_amd64}/bin/coder coder-darwin-amd64
+      cp ${slimBinaries.darwin_arm64}/bin/coder coder-darwin-arm64
+
+      runHook postUnpack
+    '';
+
+    buildPhase = ''
+      runHook preBuild
+
+      sha1sum -b coder-* | tee coder.sha1
+      tar cf coder.tar coder-*
+      zstd -22 --ultra --force --long --no-progress -o coder.tar.zst coder.tar
+
+      runHook postBuild
+    '';
+
+    installPhase = ''
+      runHook preInstall
+
+      mkdir -p $out/share
+      cp coder.{sha1,tar.zst} $out/share
+
+      runHook postInstall
+    '';
   };
 in
-stdenvNoCC.mkDerivation (finalAttrs: {
+(buildGoModule rec {
   pname = "coder";
   version = channels.${channel}.version;
-  src = fetchurl {
-    hash = (channels.${channel}.hash).${system};
 
-    url =
-      let
-        systemName =
-          {
-            x86_64-linux = "linux_amd64";
-            aarch64-linux = "linux_arm64";
-            x86_64-darwin = "darwin_amd64";
-            aarch64-darwin = "darwin_arm64";
-          }
-          .${system};
+  src = channels.${channel}.src;
 
-        ext =
-          {
-            x86_64-linux = "tar.gz";
-            aarch64-linux = "tar.gz";
-            x86_64-darwin = "zip";
-            aarch64-darwin = "zip";
-          }
-          .${system};
-      in
-      "https://github.com/coder/coder/releases/download/v${finalAttrs.version}/coder_${finalAttrs.version}_${systemName}.${ext}";
-  };
+  frontend = stdenvNoCC.mkDerivation (finalAttrs: {
+    pname = "coder-frontend";
+    inherit version;
+
+    src = "${src}/site";
+
+    nativeBuildInputs = [
+      nodejs_20
+      pnpmConfigHook
+      pnpm_nodejs_20
+    ];
+
+    buildPhase = ''
+      runHook preBuild
+      pnpm build
+      runHook postBuild
+    '';
+
+    installPhase = ''
+      runHook preInstall
+      cp -r out $out
+      runHook postInstall
+    '';
+
+    pnpmDeps = fetchPnpmDeps {
+      inherit (finalAttrs) pname version src;
+      pnpm = pnpm_nodejs_20;
+      fetcherVersion = 3;
+      hash = channels.${channel}.pnpmDepsHash;
+    };
+  });
 
   nativeBuildInputs = [
     installShellFiles
     makeBinaryWrapper
-    unzip
   ];
 
-  unpackPhase = ''
-    runHook preUnpack
+  vendorHash = channels.${channel}.vendorHash;
+  subPackages = [ subPackage ];
 
-    case $src in
-        *.tar.gz) tar -xz -f "$src" ;;
-        *.zip)    unzip      "$src" ;;
-    esac
+  ldflags = [
+    "-s"
+    "-w"
+    "-X=github.com/coder/coder/v2/buildinfo.tag=${version}-nixpkgs"
+  ]
+  ++ lib.optional agplLicensed "-X=github.com/coder/coder/v2/buildinfo.agpl=true";
 
-    runHook postUnpack
-  '';
+  tags = [ "embed" ] ++ omitTags;
 
-  installPhase = ''
-    runHook preInstall
-
-    install -D -m755 coder $out/bin/coder
-
-    runHook postInstall
+  preBuild = ''
+    cp -r ${frontend} site/out
+    cp -r ${bundle}/share site/out/bin
   '';
 
   postInstall = ''
+    installShellCompletion --cmd coder \
+      --bash <($out/bin/coder completion bash) \
+      --fish <($out/bin/coder completion fish) \
+      --zsh <($out/bin/coder completion zsh)
+
     wrapProgram $out/bin/coder \
       --prefix PATH : ${lib.makeBinPath [ terraform ]}
   '';
 
-  # integration tests require network access
   doCheck = false;
 
   meta = {
@@ -105,12 +239,5 @@ stdenvNoCC.mkDerivation (finalAttrs: {
       ghuntley
       kylecarbs
     ];
-  };
-
-  passthru = {
-    updateScript = ./update.sh;
-    tests = {
-      inherit (nixosTests) coder;
-    };
   };
 })
